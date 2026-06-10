@@ -1,0 +1,27 @@
+name: fastzap-whatsapp-api-v2
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    ports:
+      - "${PORT:-5300}:${PORT:-5300}"
+    volumes:
+      - wa_sessions_data:/app/sessions
+    env_file:
+      - .env
+    environment:
+      SESSIONS_DIR: /app/sessions
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:' + (process.env.PORT || 5300) + '/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  wa_sessions_data:
+    driver: local

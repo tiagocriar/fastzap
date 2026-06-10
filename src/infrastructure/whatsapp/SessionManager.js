@@ -1,0 +1,372 @@
+import fs from "fs";
+import path from "path";
+import pino from "pino";
+import { BaileysClient } from "./BaileysClient.js";
+import { env } from "../../config/env.js";
+import {
+  SessionAlreadyExistsError,
+  SessionNotFoundError,
+} from "../../domain/errors/index.js";
+
+const logger = pino({
+  level: env.NODE_ENV === "production" ? "info" : "debug",
+}).child({
+  module: "SessionManager",
+});
+
+const MAX_SETUP_ATTEMPTS = 3;
+
+export class SessionManager {
+  #clients = new Map();
+  #retryCount = new Map();
+  #pairingCodes = new Map();
+  #messageListeners = [];
+  #disconnectListeners = [];
+  #authenticatedListeners = [];
+
+  async restoreAll() {
+    const sessionsDir = path.resolve(env.SESSIONS_DIR);
+
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      logger.info("Diretório de sessões criado");
+      return;
+    }
+
+    const entries = fs.readdirSync(sessionsDir, { withFileTypes: true });
+    const sessionDirs = entries
+      .filter((e) => e.isDirectory() && e.name.startsWith("md_"))
+      .map((e) => e.name.replace("md_", ""));
+
+    if (sessionDirs.length === 0) {
+      logger.info("Nenhuma sessão para restaurar");
+      return;
+    }
+
+    const { restorable, orphaned } = this.#classifySessionDirs(
+      sessionsDir,
+      sessionDirs,
+    );
+
+    for (const id of orphaned) {
+      const authDir = path.resolve(sessionsDir, `md_${id}`);
+      fs.rmSync(authDir, { recursive: true, force: true });
+      logger.info({ sessionId: id }, "Pasta órfã removida no startup");
+    }
+
+    if (restorable.length === 0) {
+      logger.info("Nenhuma sessão para restaurar");
+      return;
+    }
+
+    logger.info({ count: restorable.length }, "Restaurando sessões");
+
+    await Promise.allSettled(
+      restorable.map((id) =>
+        this.#startClient(id).catch((err) =>
+          logger.error({ sessionId: id, err }, "Falha ao restaurar sessão"),
+        ),
+      ),
+    );
+  }
+
+  #classifySessionDirs(sessionsDir, sessionDirs) {
+    const restorable = [];
+    const orphaned = [];
+
+    for (const id of sessionDirs) {
+      const credsPath = path.resolve(sessionsDir, `md_${id}`, "creds.json");
+
+      if (!fs.existsSync(credsPath)) {
+        logger.warn({ sessionId: id }, "Sessão sem creds.json");
+        orphaned.push(id);
+        continue;
+      }
+
+      try {
+        JSON.parse(fs.readFileSync(credsPath, "utf8"));
+        restorable.push(id);
+      } catch (err) {
+        logger.error(
+          { sessionId: id, err: err.message },
+          "creds.json corrompido",
+        );
+        orphaned.push(id);
+      }
+    }
+
+    return { restorable, orphaned };
+  }
+
+  async create(sessionId, phoneNumber = null) {
+    if (this.#clients.has(sessionId)) {
+      const existingClient = this.#clients.get(sessionId);
+
+      if (existingClient.isAuthenticated) {
+        throw new SessionAlreadyExistsError(sessionId);
+      }
+
+      const cached = this.#pairingCodes.get(sessionId);
+      if (cached && phoneNumber && Date.now() - cached.generatedAt < 60_000) {
+        logger.info({ sessionId }, "Reutilizando pairing code existente");
+        return { type: "pairing_code", value: cached.code };
+      }
+
+      logger.info(
+        { sessionId },
+        "Sessão não autenticada encontrada, destruindo antes de recriar",
+      );
+      await this.#destroyClient(sessionId);
+    }
+
+    this.#cleanAuthFromDisk(sessionId);
+
+    return this.#createWithRetry(sessionId, phoneNumber, 1);
+  }
+
+  async delete(sessionId) {
+    const client = this.#clients.get(sessionId);
+
+    if (!client) {
+      throw new SessionNotFoundError(sessionId);
+    }
+
+    this.#retryCount.delete(sessionId);
+    this.#pairingCodes.delete(sessionId);
+    await client.disconnect();
+    this.#clients.delete(sessionId);
+
+    const authDir = path.resolve(env.SESSIONS_DIR, `md_${sessionId}`);
+    if (fs.existsSync(authDir)) {
+      fs.rmSync(authDir, { recursive: true, force: true });
+    }
+
+    logger.info({ sessionId }, "Sessão removida");
+  }
+
+  getClient(sessionId) {
+    return this.#clients.get(sessionId) ?? null;
+  }
+
+  has(sessionId) {
+    return this.#clients.has(sessionId);
+  }
+
+  isConnected(sessionId) {
+    const client = this.#clients.get(sessionId);
+    return client?.isAuthenticated ?? false;
+  }
+
+  listIds() {
+    return [...this.#clients.keys()];
+  }
+
+  onMessage(listener) {
+    this.#messageListeners.push(listener);
+  }
+
+  onDisconnect(listener) {
+    this.#disconnectListeners.push(listener);
+  }
+
+  onAuthenticated(listener) {
+    this.#authenticatedListeners.push(listener);
+  }
+
+  async #createWithRetry(sessionId, phoneNumber, attempt) {
+    logger.info(
+      { sessionId, attempt, maxAttempts: MAX_SETUP_ATTEMPTS },
+      "Iniciando setup da sessão",
+    );
+
+    return new Promise((resolve, reject) => {
+      const client = new BaileysClient(sessionId);
+
+      const cleanup = () => {
+        client.removeAllListeners();
+      };
+
+      client.once("pairing_code", (code) => {
+        cleanup();
+        this.#pairingCodes.set(sessionId, { code, generatedAt: Date.now() });
+        this.#bindLiveEvents(sessionId, client);
+        this.#clients.set(sessionId, client);
+        logger.info({ sessionId, code }, "Pairing code gerado");
+        resolve({ type: "pairing_code", value: code });
+      });
+
+      client.once("qr", (qrBase64) => {
+        cleanup();
+        this.#bindLiveEvents(sessionId, client);
+        this.#clients.set(sessionId, client);
+        logger.info({ sessionId }, "QR code gerado");
+        resolve({ type: "qr", value: qrBase64 });
+      });
+
+      client.once("connected", () => {
+        cleanup();
+        this.#bindLiveEvents(sessionId, client);
+        this.#clients.set(sessionId, client);
+        logger.info(
+          { sessionId },
+          "Sessão conectada sem QR/pairing (creds válidas)",
+        );
+        resolve({ type: "authenticated" });
+      });
+
+      client.once("setup_failed", async (reason) => {
+        cleanup();
+        await client.close().catch(() => {});
+        logger.warn({ sessionId, reason, attempt }, "Setup falhou");
+
+        if (attempt < MAX_SETUP_ATTEMPTS) {
+          const delay = attempt * 2000;
+          logger.info({ sessionId, attempt, delay }, "Tentando novamente...");
+          setTimeout(() => {
+            this.#cleanAuthFromDisk(sessionId);
+            this.#createWithRetry(sessionId, phoneNumber, attempt + 1)
+              .then(resolve)
+              .catch(reject);
+          }, delay);
+        } else {
+          reject(
+            new Error(
+              `Falha ao iniciar sessão '${sessionId}' após ${MAX_SETUP_ATTEMPTS} tentativas: ${reason}`,
+            ),
+          );
+        }
+      });
+
+      const timeout = setTimeout(async () => {
+        cleanup();
+        await client.close().catch(() => {});
+        const mode = phoneNumber ? "pairing code" : "QR";
+        reject(
+          new Error(`Timeout aguardando ${mode} da sessão '${sessionId}'`),
+        );
+      }, 30_000);
+
+      client.once("pairing_code", () => clearTimeout(timeout));
+      client.once("qr", () => clearTimeout(timeout));
+      client.once("connected", () => clearTimeout(timeout));
+      client.once("setup_failed", () => clearTimeout(timeout));
+
+      client.connect(phoneNumber).catch(async (err) => {
+        cleanup();
+        clearTimeout(timeout);
+        await client.close().catch(() => {});
+        reject(err);
+      });
+    });
+  }
+
+  #bindLiveEvents(sessionId, client) {
+    client.on("connected", () => {
+      this.#retryCount.set(sessionId, 0);
+      logger.info({ sessionId }, "Sessão conectada");
+    });
+
+    client.on("authenticated", (phone) => {
+      this.#pairingCodes.delete(sessionId);
+      logger.info({ sessionId, phoneNumber: phone }, "Sessão autenticada");
+      for (const listener of this.#authenticatedListeners) {
+        listener(sessionId, phone);
+      }
+    });
+
+    client.on("disconnected", (reason, shouldReconnect) => {
+      logger.warn(
+        { sessionId, reason, shouldReconnect },
+        "Sessão desconectada",
+      );
+
+      if (shouldReconnect) {
+        this.#scheduleReconnect(sessionId);
+      } else {
+        this.#clients.delete(sessionId);
+        this.#retryCount.delete(sessionId);
+
+        for (const listener of this.#disconnectListeners) {
+          listener(sessionId, reason);
+        }
+      }
+    });
+
+    client.on("message", (message, sid) => {
+      for (const listener of this.#messageListeners) {
+        listener(message, sid);
+      }
+    });
+  }
+
+  async #destroyClient(sessionId) {
+    const client = this.#clients.get(sessionId);
+
+    if (client) {
+      client.removeAllListeners();
+      await client.close().catch(() => {});
+    }
+
+    this.#clients.delete(sessionId);
+    this.#pairingCodes.delete(sessionId);
+    this.#retryCount.delete(sessionId);
+  }
+
+  #cleanAuthFromDisk(sessionId) {
+    const authDir = path.resolve(env.SESSIONS_DIR, `md_${sessionId}`);
+    if (fs.existsSync(authDir)) {
+      fs.rmSync(authDir, { recursive: true, force: true });
+      logger.info({ sessionId }, "Auth removida do disco");
+    }
+  }
+
+  async #startClient(sessionId, phoneNumber = null) {
+    const client = new BaileysClient(sessionId);
+    this.#clients.set(sessionId, client);
+    this.#bindLiveEvents(sessionId, client);
+    await client.connect(phoneNumber);
+  }
+
+  #scheduleReconnect(sessionId) {
+    const attempts = (this.#retryCount.get(sessionId) ?? 0) + 1;
+    this.#retryCount.set(sessionId, attempts);
+
+    if (attempts > env.MAX_RETRIES) {
+      logger.error(
+        { sessionId, attempts },
+        "Máximo de tentativas atingido, sessão perdida",
+      );
+      this.#clients.delete(sessionId);
+      this.#retryCount.delete(sessionId);
+
+      for (const listener of this.#disconnectListeners) {
+        listener(sessionId, "max_retries_exceeded");
+      }
+
+      return;
+    }
+
+    const delay = Math.min(env.RECONNECT_INTERVAL_MS * attempts, 60_000);
+    logger.info({ sessionId, attempts, delayMs: delay }, "Reconexão agendada");
+
+    setTimeout(async () => {
+      if (!this.#clients.has(sessionId)) return;
+
+      try {
+        const client = this.#clients.get(sessionId);
+        client.removeAllListeners();
+        await client.close().catch(() => {});
+        this.#clients.delete(sessionId);
+        await this.#startClient(sessionId);
+      } catch (err) {
+        logger.error({ sessionId, err }, "Falha ao reconectar sessão");
+        this.#clients.delete(sessionId);
+        this.#retryCount.delete(sessionId);
+
+        for (const listener of this.#disconnectListeners) {
+          listener(sessionId, "reconnect_failed");
+        }
+      }
+    }, delay);
+  }
+}
